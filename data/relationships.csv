@@ -1,0 +1,27 @@
+from_id,to_id,relation_type,description
+tang_seng,sun_wukong,师徒,唐僧救出五行山下的悟空并收为大徒弟
+tang_seng,zhu_bajie,师徒,唐僧在高老庄收八戒为二徒弟
+tang_seng,sha_wujing,师徒,唐僧在流沙河收沙僧为三徒弟
+tang_seng,bai_long_ma,坐骑,白龙马化身白马驮唐僧西行
+sun_wukong,zhu_bajie,师兄弟,悟空排行第一 八戒排行第二
+sun_wukong,sha_wujing,师兄弟,悟空排行第一 沙僧排行第三
+zhu_bajie,sha_wujing,师兄弟,八戒排行第二 沙僧排行第三
+guanyin,tang_seng,度化,观音菩萨点化唐僧西天取经
+guanyin,sun_wukong,度化,观音菩萨点化悟空保护唐僧
+guanyin,zhu_bajie,度化,观音菩萨点化八戒保护唐僧
+guanyin,sha_wujing,度化,观音菩萨点化沙僧保护唐僧
+guanyin,bai_long_ma,度化,观音菩萨点化白龙马驮唐僧
+rulai,sun_wukong,镇压,如来佛祖将悟空压在五行山下
+yudi,sun_wukong,敌对,悟空大闹天宫 玉帝派兵围剿
+yudi,niu_mowang,敌对,牛魔王也是当年反抗天庭的妖魔
+sun_wukong,niu_mowang,结拜兄弟,悟空称牛魔王为大哥
+niu_mowang,tieshan_gongzhu,夫妻,牛魔王与铁扇公主结为夫妻
+niu_mowang,hong_haier,父子,牛魔王是红孩儿的父亲
+tieshan_gongzhu,hong_haier,母子,铁扇公主是红孩儿的母亲
+guanyin,hong_haier,收徒,观音菩萨收红孩儿为善财童子
+sun_wukong,hong_haier,敌对,红孩儿三昧真火差点烧死悟空
+sun_wukong,baigujing,降妖,悟空三打白骨精
+tang_seng,baigujing,敌对,白骨精想吃唐僧肉
+tang_seng,zhenyuanzi,故交,唐僧前世是金蝉子 与镇元子有旧
+sun_wukong,zhenyuanzi,结拜,悟空推倒人参果树后与镇元子结拜
+tang_seng,nu'er_guo_wang,爱慕,女儿国国王对唐僧一见钟情
