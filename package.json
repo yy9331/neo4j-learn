@@ -1,13 +1,13 @@
 {
-  "name": "",
+  "name": "neo4j-learn",
   "version": "1.0.0",
-  "description": "",
+  "description": "Neo4j 图数据库学习仓库:西游记人物关系图实战,使用 neo4j-driver 与 @neo4j/cypher-builder 程序化构建 Cypher",
   "main": "index.js",
   "type": "module",
   "license": "AGPL-version-3.0",
   "private": false,
   "engines": {
-    "node": ">= 14.0.0",
+    "node": ">= 20.0.0",
     "npm": ">= 6.0.0"
   },
   "homepage": "",
@@ -16,7 +16,12 @@
     "url": ""
   },
   "bugs": "",
-  "keywords": [],
+  "keywords": [
+    "neo4j",
+    "cypher",
+    "graph-database",
+    "learning"
+  ],
   "author": {
     "name": "",
     "email": "",
@@ -24,10 +29,11 @@
   },
   "contributors": [],
   "scripts": {
-    "dev": "",
-    "test": ""
+    "connect": "node index.js",
+    "import-data": "node import.js"
   },
   "dependencies": {
-    "@neo4j/cypher-builder": "^3.3.0"
+    "@neo4j/cypher-builder": "^3.3.0",
+    "neo4j-driver": "^6.2.0"
   }
 }

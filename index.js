@@ -1,6 +1,7 @@
-const neo4j = require('neo4j-driver');
+import neo4j from 'neo4j-driver';
+import { Match, Node, Pattern, count } from '@neo4j/cypher-builder';
 
-// ============ 配置 ============
+// ============ 配置(可用环境变量覆盖) ============
 const URI = process.env.NEO4J_URI || 'bolt://localhost:7687';
 const USER = process.env.NEO4J_USER || 'neo4j';
 const PASSWORD = process.env.NEO4J_PASSWORD || 'your_password';
@@ -13,14 +14,18 @@ async function main() {
 
   const session = driver.session();
   try {
-    // 2) 清空数据库:DETACH DELETE 先断开所有关系再删除节点
-    const res = await session.run('MATCH (n) DETACH DELETE n');
-    const stats = res.summary.counters.updates();
-    console.log(`🗑️  数据库已清空:删除节点 ${stats.nodesDeleted} 个,关系 ${stats.relationshipsDeleted} 条`);
+    // 2) 探针:用 cypher-builder 构造 MATCH (n) RETURN count(n) 确认能正常查询
+    const n = new Node();
+    const countQuery = new Match(new Pattern(n)).return(count(n));
+    const { cypher, params } = countQuery.build();
+    const res = await session.run(cypher, params);
 
-    // 3) 探针:确认数据库为空
-    const count = await session.run('MATCH (n) RETURN count(n) AS cnt');
-    console.log(`📊 当前节点数:${count.records[0].get('cnt').toNumber()}`);
+    const nodeCount = res.records[0].get('count(this0)').toNumber();
+    console.log(`📊 当前数据库节点数:${nodeCount}`);
+
+    // 调试:打印生成的 Cypher(方便对照学习)
+    console.log('\n📋 生成的 Cypher 对照:');
+    console.log('  计数:', cypher);
   } finally {
     await session.close();
     await driver.close();
