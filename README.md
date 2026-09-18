@@ -10,6 +10,7 @@ Neo4j 图数据库学习仓库,使用 **西游记人物关系图** 作为练习�
 
 ## 目录
 
+- [学习路线图(6 阶段)](LEARNING_PATH.md) — 进度跟踪、知识点清单、易错点汇总
 - [一、环境准备](#一环境准备)
 - [二、两个核心脚本](#二两个核心脚本)
 - [三、Neo4j Browser 使用](#三neo4j-browser-使用)
@@ -488,6 +489,7 @@ console.log(params);    // 参数对象
 ```
 neo4j-learn/
 ├── README.md              # 本文档
+├── LEARNING_PATH.md       # 学习路线图(6 阶段进度 + 易错点)
 ├── package.json           # ESM 配置 + 依赖
 ├── index.js               # 连接测试 + 清空数据库
 ├── import.js              # 导入西游记数据(用 cypher-builder)
