@@ -10,8 +10,8 @@
 |------|------|------|
 | 第 1 阶段:Cypher 查询基础 | ✅ 已完成 | 见下方"第 1 阶段易错点" |
 | 第 2 阶段:图遍历(核心) | ✅ 已完成 | 变长路径、最短路径、方向踩坑 |
-| 第 3 阶段:写入与数据建模 | ⏳ 待开始 | SET/REMOVE、多标签、方向设计 |
-| 第 4 阶段:索引与性能 | ⏳ 待开始 | 索引、EXPLAIN/PROFILE |
+| 第 3 阶段:写入与数据建模 | ✅ 已完成 | SET/REMOVE、多标签、MERGE、方向设计、建模思维 |
+| 第 4 阶段:索引与性能 | ⏳ 待开始 | 索引、EXPLAIN/PROFILE、DB hits |
 | 第 5 阶段:高级 Cypher | ⏳ 待开始 | 子查询、列表推导、CASE WHEN |
 | 第 6 阶段:生产实践 | ⏳ 选学 | driver 单例、APOC、GDS、备份 |
 
@@ -533,40 +533,178 @@ MATCH (a:Person)-[r]->(b) RETURN a, r, b;
 
 ---
 
-## 第 3 阶段:写入与数据建模 ⏳
+## 第 3 阶段:写入与数据建模 ✅
+
+> ⚠️ 本阶段会修改/删除数据,全部练习完后重跑 `node import.js` 恢复。
 
 ### 3.1 知识点清单
 
-| 知识点 | 干什么 | 示例 |
+| 知识点 | 干什么 | 状态 |
 |--------|--------|------|
-| `MERGE` + `ON CREATE SET` | 幂等导入 | 见 README 第八节 |
-| `SET` / `REMOVE` | 修改属性、加标签 | `MATCH (p:Person {name:'孙悟空'}) SET p.weapon = '金箍棒' RETURN p;` |
-| 多标签节点 | 一个节点多种类型 | `CREATE (n:Person:Immortal {name:'镇元子'});` |
-| `DELETE` vs `DETACH DELETE` | 删节点(连关系一起删) | `MATCH (p:Person {name:'白骨精'}) DETACH DELETE p;` |
-| `REMOVE` 标签 | 去掉标签 | `MATCH (p:Person {name:'孙悟空'}) REMOVE p:Immortal;` |
-| 关系方向设计 | 哪种方向更符合业务 | 思考:`师徒` 应该 `唐僧->悟空` 还是反向? |
-| 属性 vs 关系 | 何时该建模成关系 | "年龄"是属性,"师徒"是关系 |
-| 反范式 | 冗余属性换查询性能 | 把常用查询的属性复制到节点 |
+| `SET` / `SET +=` | 修改/新增属性 | ✅ |
+| `REMOVE` / `SET prop = NULL` | 删除属性 | ✅ |
+| `SET :标签` / `REMOVE :标签` | 加/减标签 | ✅ |
+| `DELETE` vs `DETACH DELETE` | 删节点(连关系一起删) | ✅ |
+| `MERGE` + `ON CREATE SET` / `ON MATCH SET` | 幂等写入 | ✅ |
+| 关系也能 SET 属性 | `SET r.rank = '大徒弟'` | ✅ |
+| 关系方向设计 | 方向 = 最常用查询方向 | ✅ |
+| 属性 vs 关系 | 不产生联系的做属性 | ✅ |
+| 反范式取舍 | 冗余换性能,代价是一致性 | ✅ |
 
-**学习目标:** 给人物加武器、法力值等属性,思考"夫妻"和"师徒"该用单向还是双向关系。
+### 3.2 示例查询(直接跑)
+
+```cypher
+-- 1) SET 单个属性
+MATCH (p:Person {name:'孙悟空'}) SET p.weapon = '金箍棒' RETURN p.name, p.weapon;
+
+-- 2) SET += 合并 map
+MATCH (p:Person {name:'沙悟净'}) SET p += {weapon: '降妖宝杖', origin: '流沙河'} RETURN p.name, p.weapon, p.origin;
+
+-- 3) REMOVE / SET NULL(等价)
+MATCH (p:Person {name:'沙悟净'}) REMOVE p.origin;
+MATCH (p:Person {name:'沙悟净'}) SET p.origin = NULL;
+
+-- 4) 加标签
+MATCH (p:Person {name:'镇元子'}) SET p:Immortal RETURN labels(p) AS 标签;
+
+-- 5) DELETE 有关系节点会报错
+MATCH (p:Person {name:'红孩儿'}) DELETE p;  -- ❌ 报错
+MATCH (p:Person {name:'红孩儿'}) DETACH DELETE p;  -- ✅ 连关系一起删
+
+-- 6) MERGE + ON CREATE/ON MATCH
+MERGE (p:Person {id:'erlang_shen', name:'杨戬'})
+ON CREATE SET p.created = true, p.role = '天庭'
+ON MATCH SET p.matched = true
+RETURN p;
+-- 第一次:created=true;第二次:matched=true(幂等)
+
+-- 7) 关系 SET 属性
+MATCH (t:Person {name:'唐僧'})-[r:师徒]->(s:Person {name:'孙悟空'})
+SET r.rank = '大徒弟'
+RETURN t.name, type(r) AS 关系, r.rank AS 排行, s.name;
+
+-- 8) 方向思考:师徒是 唐僧->徒弟
+MATCH (m)-[:师徒]->(t) WHERE m.name='唐僧' RETURN t.name;  -- 查徒弟
+MATCH (m)<-[:师徒]-(t) WHERE m.name='唐僧' RETURN t.name;  -- 查师傅(空)
+MATCH (m:Person) WHERE NOT (m)<-[:师徒]-() RETURN m.name;  -- 查没有师傅的人(唐僧)
+```
+
+### 3.3 建模三原则(必考)
+
+| 问题 | 决策依据 | 结论 |
+|------|---------|------|
+| **关系方向** | 选最常用查询方向;双向常查用无向查询 | `师徒` 建 `唐僧->徒弟`,查徒弟快 |
+| **属性 vs 节点** | 不产生联系的做属性;需要独立查询/有自己属性/多节点关联时升级为节点 | 金箍棒→属性;金箍棒曾被多人拿过→节点 |
+| **范式 vs 反范式** | 读远多于写、性能瓶颈时反范式;代价是数据一致性要维护 | role 冗余到关系上→查询快,改 role 要改多处 |
+
+### 3.4 易错点(本次练习踩过的坑)
+
+1. **别名不能用字符串模板**:Cypher 的 AS 列名是静态标识符,不支持 `${p.name}标签列表` 这种动态插值,动态内容放值里
+2. **DETACH DELETE 后 RETURN 节点为空**:节点已删,应该 `RETURN count(p)` 或 `RETURN p` 放在 DELETE 前面
+3. **CREATE 重复执行会重复创建**:CREATE 无脑新建,要幂等用 MERGE + 唯一约束
+4. **方向反了查不到**:数据方向是 `唐僧->徒弟`,反方向 `<-[:师徒]-` 查的是"谁是唐僧的师傅",空结果是正确的
+5. **RETURN 关系对象 Table 视图隐藏属性**:Browser 默认只显示关系类型名,显式写 `r.rank` 或点 Raw 标签看完整属性
+
+### 3.5 数据恢复
+
+```bash
+node import.js
+```
 
 ---
 
 ## 第 4 阶段:索引与性能(项目变大后必学) ⏳
 
+> 本阶段全部只读查询,不修改数据,跑完后直接恢复(或不用恢复)。
+
 ### 4.1 知识点清单
 
-| 知识点 | 干什么 | 示例 |
+| 知识点 | 干什么 | 状态 |
 |--------|--------|------|
-| 创建索引 | 加速按属性查找 | `CREATE INDEX person_name IF NOT EXISTS FOR (p:Person) ON (p.name);` |
-| 索引类型 | RANGE / TEXT / POINT / LOOKUP | `CREATE TEXT INDEX ...` 用于全文搜 |
-| 唯一约束 | 防重复 + 自动索引 | `CREATE CONSTRAINT ... REQUIRE p.id IS UNIQUE;` |
-| `EXPLAIN` | 看查询计划不执行 | `EXPLAIN MATCH (p:Person {name:'孙悟空'}) RETURN p;` |
-| `PROFILE` | 执行 + 看 DB hits | `PROFILE MATCH (p:Person {name:'孙悟空'}) RETURN p;` |
-| DB hits | 衡量工作量 | DB hits 越少越快 |
-| 查询优化思路 | 避免笛卡尔积、用参数化、加 LIMIT | 改写慢查询 |
+| 唯一约束 | 防重复 + 自动索引 | ⏳ |
+| 普通索引 | 加速按属性查找 | ⏳ |
+| `EXPLAIN` | 看查询计划不执行 | ⏳ |
+| `PROFILE` | 执行 + 看 DB hits | ⏳ |
+| DB hits | 衡量查询工作量 | ⏳ |
+| 查询优化思路 | 避免笛卡尔积、用参数化、加 LIMIT | ⏳ |
 
-**学习目标:** 用 PROFILE 对比有无索引时查孙悟空的 DB hits 差异。
+### 4.2 为什么需要索引?
+
+现在我们只有 15 个节点,查询瞬间完成。但如果有 100 万个节点,每次 `MATCH (p:Person {name:'孙悟空'})` 都要**全表扫描**(遍历 100 万个节点找 name='孙悟空'),会很慢。
+
+索引就是给常用查询字段**建一本书的目录**,让 Neo4j 直接定位而不是挨个翻。
+
+### 4.3 示例查询(直接跑)
+
+```cypher
+-- ===== 先看没索引时的查询成本 =====
+
+-- PROFILE 会执行查询并返回每个步骤的 DB hits
+PROFILE MATCH (p:Person {name:'孙悟空'}) RETURN p;
+-- 注意看左侧"Number of db hits"数值,记下来(大概 15 次)
+
+-- ===== 建索引 =====
+
+-- 唯一约束(自动建索引,推荐优先用):id 全局唯一
+CREATE CONSTRAINT person_id_unique IF NOT EXISTS
+FOR (p:Person) REQUIRE p.id IS UNIQUE;
+
+-- 普通索引:按 name 查找加速
+CREATE INDEX person_name IF NOT EXISTS
+FOR (p:Person) ON (p.name);
+
+-- ===== 再看有索引时的查询成本 =====
+PROFILE MATCH (p:Person {name:'孙悟空'}) RETURN p;
+-- DB hits 应该大幅下降(从 15 降到 1~2)
+
+-- ===== EXPLAIN 只看计划不执行 =====
+EXPLAIN MATCH (p:Person {name:'孙悟空'}) RETURN p;
+-- 会显示查询计划树,但不实际执行(适合大查询,怕跑太慢先看计划)
+
+-- ===== 查看现有索引 =====
+SHOW INDEXES;
+-- 或
+CALL db.indexes();
+
+-- ===== 删除索引 =====
+DROP INDEX person_name IF EXISTS;
+DROP CONSTRAINT person_id_unique IF EXISTS;
+```
+
+### 4.4 PROFILE 输出怎么看?
+
+PROFILE 的输出是一棵**执行计划树**,关键看：
+
+| 指标 | 含义 | 越少越好 |
+|------|------|---------|
+| **DB hits** | 访问磁盘的次数(类似 SQL 的 logical reads) | ✅ |
+| **Rows** | 该步骤处理了多少行 | ✅ |
+| **Page Cache Hit Ratio** | 缓存命中率,1.0 表示全在内存 | 越高越好 |
+
+典型对比:
+
+```
+无索引:NodeByLabelScan → 扫 15 个 Person → DB hits ≈ 15
+有索引:NodeIndexSeek  → 直接定位孙悟空   → DB hits ≈ 2
+```
+
+### 4.5 查询优化三条铁律
+
+| 规则 | 说明 | 示例 |
+|------|------|------|
+| **先过滤再遍历** | WHERE 尽量写在 MATCH 里,减少后续遍历量 | `MATCH (p:Person {name:'孙悟空'})` 比 `MATCH (p:Person) WHERE p.name='孙悟空'` 好 |
+| **加 LIMIT** | 图遍历可能返回海量路径,先 LIMIT 看结果 | `MATCH p=()-[*1..5]->() RETURN p LIMIT 20` |
+| **用参数化** | 避免每次查询都重新编译计划 | `session.run('MATCH (p:Person {name: $name})', { name })` |
+
+### 4.6 练习题
+
+**练习 1:** 用 PROFILE 对比 `MATCH (p:Person {id:'tang_seng'}) RETURN p` 在"有 id 唯一约束"前后的 DB hits 变化。
+
+**练习 2:** 给 `role` 属性建索引,用 PROFILE 对比 `MATCH (p:Person {role:'主角'}) RETURN p` 前后的 DB hits。
+
+**练习 3:** 用 EXPLAIN 分析 `MATCH p=shortestPath((a)-[*..5]-(b)) RETURN p` 的查询计划(不执行,只看计划)。
+
+**练习 4(思考题):** 为什么给 `name` 建了索引但 `MATCH (p:Person) WHERE p.name CONTAINS '悟空'` 还是走全表扫描?提示:CONTAINS / =~ 正则 / 模糊匹配都用不上普通 RANGE 索引。
 
 ---
 
@@ -641,3 +779,15 @@ cypher-builder 对照写法:见 [1.3 对应的 cypher-builder 写法](#13-对应
 - 图遍历关键是**路径变量 `p`**,`MATCH p=()` 把整条链路返回,Graph 视图才能画线
 - **方向问题是图遍历头号陷阱**:数据方向 ↔ 查询方向,shortestPath 统一用无向
 - Neo4j 图遍历性能远超传统 JOIN,但 `[*]` 任意深度要慎用
+
+### 第 3 阶段完成日期:2026-09-21
+
+练习过的查询类型:SET/SET +=、REMOVE、多标签、DELETE vs DETACH DELETE、MERGE + ON CREATE/ON MATCH、关系 SET 属性、方向设计、建模三原则(方向/属性vs节点/范式vs反范式)。
+
+踩过的坑:见上方 [3.4 易错点](#34-易错点本次练习踩过的坑)。
+
+核心收获:
+- **写入和查询同等重要** — SET/REMOVE 是日常维护,不是一次性导入
+- **建模决策影响查询效率** — 方向、属性vs节点、范式vs反范式三个问题要在设计阶段想清楚
+- **MERGE 是生产级写入首选** — CREATE 重复会乱,MERGE 保证幂等,加唯一约束更稳
+- **Browser 的 Table 视图会"简化显示"** — 关系对象默认只显示类型名,属性要显式返回或看 Raw 标签
