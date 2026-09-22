@@ -51,6 +51,20 @@ async function main() {
   const session = driver.session();
 
   try {
+    // ===== 0) 确保约束和索引存在(IF NOT EXISTS,幂等) =====
+    // Schema 操作和数据操作分开,约束/索引只需一次,写在这里保证每次重建数据都能用上
+    console.log('\n📋 [Schema] 检查约束和索引...');
+    await session.run(`
+      CREATE CONSTRAINT person_id_unique IF NOT EXISTS
+      FOR (p:Person) REQUIRE p.id IS UNIQUE;
+    `);
+    await session.run(`
+      CREATE INDEX person_name IF NOT EXISTS
+      FOR (p:Person) ON (p.name);
+    `);
+    console.log('  ✅ 约束 person_id_unique: 已存在或已创建');
+    console.log('  ✅ 索引 person_name: 已存在或已创建');
+
     // ===== 1) 清空数据库 =====
     // Cypher: MATCH (n) DETACH DELETE n
     const n = new Node();

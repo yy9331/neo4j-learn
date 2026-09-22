@@ -11,7 +11,7 @@
 | 第 1 阶段:Cypher 查询基础 | ✅ 已完成 | 见下方"第 1 阶段易错点" |
 | 第 2 阶段:图遍历(核心) | ✅ 已完成 | 变长路径、最短路径、方向踩坑 |
 | 第 3 阶段:写入与数据建模 | ✅ 已完成 | SET/REMOVE、多标签、MERGE、方向设计、建模思维 |
-| 第 4 阶段:索引与性能 | ⏳ 待开始 | 索引、EXPLAIN/PROFILE、DB hits |
+| 第 4 阶段:索引与性能 | ✅ 已完成 | 唯一约束/普通索引/EXPLAIN/PROFILE/DB hits/CartesianProduct 爆炸 |
 | 第 5 阶段:高级 Cypher | ⏳ 待开始 | 子查询、列表推导、CASE WHEN |
 | 第 6 阶段:生产实践 | ⏳ 选学 | driver 单例、APOC、GDS、备份 |
 
@@ -321,7 +321,7 @@ ORDER BY 人数 DESC;
 **错误答案:**
 
 ```cypher
-MATCH (p:Person {name:'观音菩萨'})-[:度化]->(p)
+MATCH (g:Person {name:'观音菩萨'})-[:度化]->(p)
 RETURN collect(p.name);
 ```
 
@@ -613,98 +613,268 @@ node import.js
 
 ---
 
-## 第 4 阶段:索引与性能(项目变大后必学) ⏳
+## 第 4 阶段:索引与性能(项目变大后必学) ✅
 
 > 本阶段全部只读查询,不修改数据,跑完后直接恢复(或不用恢复)。
+>
+> **核心工具:** `PROFILE` 和 `EXPLAIN` —— Neo4j 的"查询诊断显微镜"。
 
 ### 4.1 知识点清单
 
 | 知识点 | 干什么 | 状态 |
 |--------|--------|------|
-| 唯一约束 | 防重复 + 自动索引 | ⏳ |
-| 普通索引 | 加速按属性查找 | ⏳ |
-| `EXPLAIN` | 看查询计划不执行 | ⏳ |
-| `PROFILE` | 执行 + 看 DB hits | ⏳ |
-| DB hits | 衡量查询工作量 | ⏳ |
-| 查询优化思路 | 避免笛卡尔积、用参数化、加 LIMIT | ⏳ |
+| 唯一约束 | 防重复 + 自动索引 | ✅ |
+| 普通索引 | 加速按属性查找 | ✅ |
+| `EXPLAIN` | 看查询计划不执行 | ✅ |
+| `PROFILE` | 执行 + 看 DB hits | ✅ |
+| DB hits | 衡量查询工作量(磁盘访问次数) | ✅ |
+| 执行计划树 | 自底向上执行的算子链 | ✅ |
+| CartesianProduct 爆炸 | 多端点配对的性能杀手 | ✅ |
+| 查询优化思路 | 先过滤再遍历、低基数陷阱、索引配对时机 | ✅ |
 
 ### 4.2 为什么需要索引?
 
-现在我们只有 15 个节点,查询瞬间完成。但如果有 100 万个节点,每次 `MATCH (p:Person {name:'孙悟空'})` 都要**全表扫描**(遍历 100 万个节点找 name='孙悟空'),会很慢。
+现在只有 15 个节点,查询瞬间完成。但如果有 100 万个节点,每次 `MATCH (p:Person {name:'孙悟空'})` 都要**全表扫描**(遍历 100 万个节点找 name='孙悟空'),会很慢。
 
 索引就是给常用查询字段**建一本书的目录**,让 Neo4j 直接定位而不是挨个翻。
 
-### 4.3 示例查询(直接跑)
+### 4.3 约束 vs 索引:关系与区别
+
+| 特性 | 唯一约束 (CONSTRAINT) | 普通索引 (INDEX) |
+|------|----------------------|-----------------|
+| 创建语句 | `CREATE CONSTRAINT person_id_unique FOR (p:Person) REQUIRE p.id IS UNIQUE` | `CREATE INDEX person_name FOR (p:Person) ON (p.name)` |
+| 唯一性保证 | ✅ 强制,重复写入会报错 | ❌ 不保证 |
+| 底层实现 | 就是一个唯一索引 | 普通 B+树索引 |
+| 查询效率 | **完全相同**(底层都是索引查找) | 完全相同 |
+| 命名 | 随便取,建议 `{label}_{property}_unique` | 随便取,建议 `{label}_{property}` |
+| 是否自动清理 | 删约束时底层索引一起删 | 删索引直接删 |
+| **推荐优先级** | **高!** 能加约束就不加普通索引 | 仅在不需要唯一性时用 |
+
+> ⚠️ **重要:** 约束和索引是**两个独立的东西**,名字不同!删约束用 `DROP CONSTRAINT person_id_unique`,删索引用 `DROP INDEX person_name`。名字不能搞混。
+
+### 4.4 PROFILE 执行计划树详解
+
+PROFILE 的输出是一棵**自底向上执行**的树,每个算子是一层。用"无约束 role 查询"为例:
+
+**查询:** `PROFILE MATCH (p:Person {role:'主角'}) RETURN p;`
+
+```
+        +ProduceResults     ← 第 1 层:结果出口(给用户返回数据)
+           |
+        +Filter             ← 第 2 层:过滤器(逐行检查 role='主角')
+           |
+        +NodeByLabelScan    ← 第 3 层:数据源头(扫所有 Person 节点)
+```
+
+**各算子含义:**
+
+| 算子 | 干什么 | DB Hits 特点 |
+|------|--------|-------------|
+| **NodeByLabelScan** | 全表扫描,扫遍所有带某标签的节点 | = 节点数 + 1(标签索引查找) |
+| **NodeIndexSeek** | 用普通 B+树索引定位节点 | = 索引树高度 + 桶扫描数 + 节点取数 |
+| **NodeUniqueIndexSeek** | 用唯一索引定位节点(最多返回 1 条) | 最少,B+树一次命中 |
+| **Filter** | 对上一层吐出来的行逐行过滤 | = 上一层 Rows × 每行属性读取 |
+| **ProduceResults** | 把结果返回给用户 | = 返回行数 × 每行完整属性读取 |
+| **CartesianProduct** | 把两个分支的结果做笛卡尔积 | 不直接读磁盘,但放大后续工作量(= 左 Rows × 右 Rows) |
+| **ShortestPath** | 双向 BFS 最短路径算法 | = 遍历的关系数 + 邻居节点数,跳数越大越贵 |
+
+### 4.5 练习题 & 对比数据
+
+> 下面的数据都是在 15 节点 + 26 关系的测试集上实测的。数据量越小差距越不明显,数据量大(万级以上)时倍数会更大。
+
+#### 练习 1:唯一约束 vs 无约束 — id 查询
+
+**准备:** 先删约束 `DROP CONSTRAINT person_id_unique;`,跑 PROFILE,再重跑 `node import.js` 恢复约束,再跑 PROFILE。
+
+**查询:** `PROFILE MATCH (p:Person {id:'tang_seng'}) RETURN p;`
+
+| 指标 | 有唯一约束 `person_id_unique` | 无约束/索引 |
+|------|------------------------------|------------|
+| **执行计划** | `NodeUniqueIndexSeek` | `NodeByLabelScan` + `Filter` |
+| Node 查找 DB Hits | **2**(B+树一次命中) | 16(扫 15 个节点) |
+| Filter DB Hits | 无(索引已过滤) | 15(逐行比对 id) |
+| **Total DB Hits** | **6** | **36** |
+| 返回行数 | 1 | 1 |
+| **差距** | — | **6 倍** |
+
+**关键:** `NodeUniqueIndexSeek` 知道结果最多 1 条,直接 B+树定位,不需要 Filter。
+
+---
+
+#### 练习 2:普通索引 vs 无索引 — role 查询
+
+**准备:** 先建索引 `CREATE INDEX person_role IF NOT EXISTS FOR (p:Person) ON (p.role);`,跑 PROFILE,再删索引 `DROP INDEX person_role;`,再跑 PROFILE。
+
+**查询:** `PROFILE MATCH (p:Person {role:'主角'}) RETURN p;`
+
+| 指标 | 有普通索引 `person_role` | 无索引 |
+|------|------------------------|--------|
+| **执行计划** | `NodeIndexSeek` (RANGE 模式) | `NodeByLabelScan` + `Filter` |
+| 节点查找 DB Hits | **6** | 16 + 15 = 31 |
+| **Total DB Hits** | **26** | **56** |
+| 返回行数 | 5 | 5 |
+| **差距** | — | **2 倍** |
+
+**三方对比:**
+
+| 查询类型 | 执行计划 | Total DB Hits | 原因 |
+|---------|---------|---------------|------|
+| id(唯一约束,高基数) | NodeUniqueIndexSeek | **6** | 唯一值,B+树精准定位 |
+| role(普通索引,低基数) | NodeIndexSeek | **26** | 5 个值,索引桶里还要扫 5 个节点 |
+| role(无索引) | NodeByLabelScan + Filter | **56** | 全扫 + 逐行过滤 |
+
+> 💡 **低基数陷阱:** role 只有 5 个值,`{role:'主角'}` 走索引后仍然要扫 5 个节点 ID,再去取节点属性——和全表扫 15 个节点的差距只有 2 倍。如果 role 只有 2 个值,建索引甚至可能**比全表扫还慢**(索引查找开销 > 直接扫少量节点)。
+
+---
+
+#### 练习 3:shortestPath 端点索引 vs 无过滤
+
+**查询 A(有端点过滤 + 索引):**
+```cypher
+PROFILE MATCH p = shortestPath(
+  (a:Person {name:'唐僧'})-[*..5]-(b:Person {name:'如来佛祖'})
+) RETURN p;
+```
+
+| 算子 | DB Hits | Rows | 说明 |
+|------|---------|------|------|
+| ProduceResults | 19 | 1 | 返回路径 |
+| ShortestPath | 11 | 1 | 双向 BFS 跑 1 对节点 |
+| CartesianProduct | 0 | 1 | 1×1 = 1 对 |
+| NodeIndexSeek (找 a) | 2 | 1 | person_name 索引 |
+| NodeIndexSeek (找 b) | 2 | 1 | person_name 索引 |
+| **Total** | **34** | — | — |
+
+**查询 B(无端点过滤,CartesianProduct 爆炸):**
+```cypher
+PROFILE MATCH p = shortestPath((a:Person)-[*..5]-(b:Person))
+WHERE a <> b RETURN p;
+```
+
+| 算子 | DB Hits | Rows | 说明 |
+|------|---------|------|------|
+| ProduceResults | 3318 | 182 | 返回 182 条路径 |
+| ShortestPath | 1538 | 182 | 210 对节点,每对跑 BFS |
+| Filter | 0 | 210 | a <> b 过滤 |
+| CartesianProduct | 0 | 225 | 15×15 = 225 对! |
+| NodeByLabelScan (找 a) | 16 | 15 | 全扫 |
+| NodeByLabelScan (找 b) | 240 | 225 | 全扫 × 15 次 |
+| **Total** | **5112** | — | — |
+
+**差距:34 → 5112,150 倍!** 💥
+
+> 💡 **CartesianProduct 是性能杀手!** 两个分支各返回 N 行,CartesianProduct 就产生 N² 对,每对都要跑 shortestPath。**务必给 shortestPath 端点加精确属性过滤**,把 CartesianProduct 输入压到 1 对。
+
+> ⚠️ **踩坑:** shortestPath 起点终点相同时会报错 "start and end nodes are the same",所以无过滤查询要加 `WHERE a <> b`,但这只是让它能跑起来,并没有解决 CartesianProduct 爆炸的根本问题。
+
+---
+
+#### 练习 4:`{name:'孙悟空'}` vs `WHERE p.name='孙悟空'` 谁更快?
+
+**答案:** 写法 A(属性内嵌到 Pattern)更快。
+
+| 写法 | Planner 优化时机 | 执行计划 |
+|------|-----------------|---------|
+| `MATCH (p:Person {name:'孙悟空'})` | **构建执行计划时**就绑定索引 | `NodeIndexSeek` 直接到位 |
+| `MATCH (p:Person) WHERE p.name='孙悟空'` | 先规划全扫,再考虑用索引 | 可能 `NodeByLabelScan` + `Filter`(取决于 Planner 复杂度) |
+
+**为什么叫"索引配对时机"?**
+- 写法 A:Planner 在构建 Pattern 阶段就把 `name` 属性和索引**绑定**了,直接生成 `NodeIndexSeek`
+- 写法 B:Planner 先规划 `NodeByLabelScan`,再规划 `Filter`,然后才想到"Filter 条件可以用索引"——这个优化是**后置**的,复杂查询里可能被跳过
+
+> 💡 **实战建议:** 等值匹配条件优先写在 Pattern `{}` 里,WHERE 留给范围查询(`>`,`<`,`CONTAINS`,`IN` 等)。
+
+---
+
+#### 练习 5:role 索引在遍历查询中可能失效?
+
+**查询:** `MATCH (p:Person {role:'主角'})-[:师徒]->(徒弟) RETURN 徒弟.name`
+
+**现象:** role 索引只优化了"找起点 p"这一步(省了 ~25 hits),但真正贵的是"展开师徒关系"(扫关系表 + 读徒弟节点,几十上百 hits)——索引对此无能为力!
+
+**核心认知:** 遍历查询的瓶颈在**路径展开**,不是起点定位。低基数字段索引(role 只有 5 个值)只省了几 hits,被遍历开销完全淹没。
+
+> 💡 **遍历查询优化重点:** 关系类型过滤(`-[:师徒]-`) > 路径剪枝(`WHERE length(path) < 3`) > 给起点建高基数索引(name/id)。
+
+### 4.6 EXPLAIN vs PROFILE
+
+| | EXPLAIN | PROFILE |
+|---|---------|---------|
+| 执行查询 | ❌ 只生成计划,不执行 | ✅ 执行 + 收集统计 |
+| DB hits 数值 | ❌ 没有 | ✅ 有 |
+| 用途 | 看执行计划结构,确认会不会走索引、会不会有 CartesianProduct | 精确测量 DB hits,量化优化效果 |
+| 适合场景 | 大查询不敢跑,先看计划对不对 | 对比优化前后的性能差距 |
+
+### 4.7 索引创建/删除/查看
 
 ```cypher
--- ===== 先看没索引时的查询成本 =====
-
--- PROFILE 会执行查询并返回每个步骤的 DB hits
-PROFILE MATCH (p:Person {name:'孙悟空'}) RETURN p;
--- 注意看左侧"Number of db hits"数值,记下来(大概 15 次)
-
--- ===== 建索引 =====
-
--- 唯一约束(自动建索引,推荐优先用):id 全局唯一
+-- ===== 创建 =====
 CREATE CONSTRAINT person_id_unique IF NOT EXISTS
 FOR (p:Person) REQUIRE p.id IS UNIQUE;
 
--- 普通索引:按 name 查找加速
 CREATE INDEX person_name IF NOT EXISTS
 FOR (p:Person) ON (p.name);
 
--- ===== 再看有索引时的查询成本 =====
-PROFILE MATCH (p:Person {name:'孙悟空'}) RETURN p;
--- DB hits 应该大幅下降(从 15 降到 1~2)
+-- ===== 查看 =====
+SHOW INDEXES;      -- Neo4j 5.x 新语法
+SHOW CONSTRAINTS;  -- Neo4j 5.x 新语法
+-- ❌ CALL db.indexes() / CALL db.constraints() 是旧语法,5.x 已废弃
 
--- ===== EXPLAIN 只看计划不执行 =====
-EXPLAIN MATCH (p:Person {name:'孙悟空'}) RETURN p;
--- 会显示查询计划树,但不实际执行(适合大查询,怕跑太慢先看计划)
+-- ===== 删除 =====
+-- 注意:约束和索引名字不同!不能搞混!
+DROP CONSTRAINT person_id_unique;
+DROP INDEX person_name;
 
--- ===== 查看现有索引 =====
-SHOW INDEXES;
--- 或
-CALL db.indexes();
-
--- ===== 删除索引 =====
-DROP INDEX person_name IF EXISTS;
-DROP CONSTRAINT person_id_unique IF EXISTS;
+-- ===== 恢复(重跑 import.js)=====
+node import.js
 ```
 
-### 4.4 PROFILE 输出怎么看?
+### 4.8 易错点
 
-PROFILE 的输出是一棵**执行计划树**,关键看：
+#### ❌ 易错 1:混淆约束名和索引名
 
-| 指标 | 含义 | 越少越好 |
-|------|------|---------|
-| **DB hits** | 访问磁盘的次数(类似 SQL 的 logical reads) | ✅ |
-| **Rows** | 该步骤处理了多少行 | ✅ |
-| **Page Cache Hit Ratio** | 缓存命中率,1.0 表示全在内存 | 越高越好 |
+- `person_id_unique` 是**约束**名,删约束用 `DROP CONSTRAINT person_id_unique`
+- `person_name` 是**索引**名,删索引用 `DROP INDEX person_name`
+- 不能写 `DROP INDEX person_id_unique` —— 会报 "No such index"
 
-典型对比:
+#### ❌ 易错 2:用 `CALL db.indexes()` 在 Neo4j 5.x
 
+Neo4j 5.x 废弃了 `CALL db.indexes()` 和 `CALL db.constraints()`,改用 `SHOW INDEXES` 和 `SHOW CONSTRAINTS`。
+
+#### ❌ 易错 3:shortestPath 起点终点相同导致报错
+
+```cypher
+-- ❌ 报错:"start and end nodes are the same"
+MATCH p = shortestPath((a:Person)-[*..5]-(b:Person)) RETURN p;
+
+-- ✅ 加 WHERE a <> b 排除自己到自己
+MATCH p = shortestPath((a:Person)-[*..5]-(b:Person))
+WHERE a <> b RETURN p;
 ```
-无索引:NodeByLabelScan → 扫 15 个 Person → DB hits ≈ 15
-有索引:NodeIndexSeek  → 直接定位孙悟空   → DB hits ≈ 2
-```
 
-### 4.5 查询优化三条铁律
+但即使加了 `<> b`,CartesianProduct 还是会产生 15×14 = 210 对,每对都跑 shortestPath,DB hits 爆炸。**根本解法是给端点加精确属性过滤**。
 
-| 规则 | 说明 | 示例 |
-|------|------|------|
-| **先过滤再遍历** | WHERE 尽量写在 MATCH 里,减少后续遍历量 | `MATCH (p:Person {name:'孙悟空'})` 比 `MATCH (p:Person) WHERE p.name='孙悟空'` 好 |
-| **加 LIMIT** | 图遍历可能返回海量路径,先 LIMIT 看结果 | `MATCH p=()-[*1..5]->() RETURN p LIMIT 20` |
-| **用参数化** | 避免每次查询都重新编译计划 | `session.run('MATCH (p:Person {name: $name})', { name })` |
+#### ❌ 易错 4:以为 Neo4j 内部 `<id>` 可以做索引
 
-### 4.6 练习题
+Browser 里显示的 `<id>` 是 Neo4j 的**内部 ID**,是元数据不是属性,不能建索引。而且内部 ID 在节点删除后会复用、数据库重建后会变——**绝对不能用作业务标识**。必须自己定义 `id` 属性 + 唯一约束。
 
-**练习 1:** 用 PROFILE 对比 `MATCH (p:Person {id:'tang_seng'}) RETURN p` 在"有 id 唯一约束"前后的 DB hits 变化。
+#### ❌ 易错 5:以为建了索引就万事大吉
 
-**练习 2:** 给 `role` 属性建索引,用 PROFILE 对比 `MATCH (p:Person {role:'主角'}) RETURN p` 前后的 DB hits。
+- 低基数字段(role 只有 5 个值)建索引效果有限
+- 遍历查询的瓶颈不在起点索引,而在路径展开
+- `CONTAINS` / 正则 `/xxx/` 模糊匹配用不上普通 RANGE 索引(需要全文索引)
+- 索引会增加写入开销(每次 INSERT/UPDATE 要维护 B+树)
 
-**练习 3:** 用 EXPLAIN 分析 `MATCH p=shortestPath((a)-[*..5]-(b)) RETURN p` 的查询计划(不执行,只看计划)。
+### 4.9 核心收获
 
-**练习 4(思考题):** 为什么给 `name` 建了索引但 `MATCH (p:Person) WHERE p.name CONTAINS '悟空'` 还是走全表扫描?提示:CONTAINS / =~ 正则 / 模糊匹配都用不上普通 RANGE 索引。
+| # | 收获 | 一句话总结 |
+|---|------|-----------|
+| 1 | 唯一约束 = 防重复 + 自动索引,**查询效率和普通索引完全相同** | 能加约束就不加普通索引 |
+| 2 | DB hits 是衡量查询性能的**最核心指标**,PROFILE 比 EXPLAIN 有用 | EXPLAIN 看结构,PROFILE 看成本 |
+| 3 | CartesianProduct 是图查询的**性能杀手**,必须用精确过滤把输入压到最小 | shortestPath 端点一定要加属性约束 |
+| 4 | `{prop: 'val'}` 比 `WHERE p.prop='val'` 快,因为索引配对时机更早 | 等值匹配写 Pattern 里,范围查询写 WHERE |
+| 5 | 低基数字段索引收益有限,遍历查询瓶颈在路径展开而非起点定位 | 索引优先加高基数(id/name),遍历优化靠关系过滤和剪枝 |
+| 6 | Neo4j 5.x 用 `SHOW INDEXES` / `SHOW CONSTRAINTS`,旧的 `CALL db.indexes()` 已废弃 | 升级版本要注意语法变化 |
 
 ---
 
@@ -791,3 +961,25 @@ cypher-builder 对照写法:见 [1.3 对应的 cypher-builder 写法](#13-对应
 - **建模决策影响查询效率** — 方向、属性vs节点、范式vs反范式三个问题要在设计阶段想清楚
 - **MERGE 是生产级写入首选** — CREATE 重复会乱,MERGE 保证幂等,加唯一约束更稳
 - **Browser 的 Table 视图会"简化显示"** — 关系对象默认只显示类型名,属性要显式返回或看 Raw 标签
+
+### 第 4 阶段完成日期:2026-09-22
+
+练习过的查询类型:唯一约束 vs 无约束 PROFILE 对比、普通索引 vs 无索引 PROFILE 对比、shortestPath 端点索引 vs 无过滤 CartesianProduct 爆炸、`{}` vs WHERE 索引配对时机对比、低基数陷阱与遍历查询瓶颈分析。
+
+踩过的坑:见上方 [4.8 易错点](#48-易错点)。
+
+核心收获:
+- **唯一约束 = 防重复 + 自动索引**,查询效率和普通索引完全相同,能加约束就不加普通索引
+- **DB hits 是衡量查询性能的最核心指标**,PROFILE 比 EXPLAIN 有用(EXPLAIN 看结构,PROFILE 看成本)
+- **CartesianProduct 是图查询的性能杀手**:shortestPath 无端点过滤 → 34 hits → 5112 hits,**150 倍差距**!务必给端点加精确属性过滤
+- **`{prop: 'val'}` 比 `WHERE p.prop='val'` 快**:索引配对时机更早,等值匹配写 Pattern 里
+- **低基数字段(role 5 个值)索引收益有限**:role 索引省了 25 hits,但遍历开销淹没一切。遍历查询优化重点是关系过滤和路径剪枝,不是起点索引
+- **Neo4j 5.x 语法变更**:`SHOW INDEXES` / `SHOW CONSTRAINTS` 替代旧的 `CALL db.indexes()` / `CALL db.constraints()`
+
+量化数据汇总(15 节点测试集):
+
+| 对比项 | 有约束/索引 | 无约束/索引 | 倍数 |
+|--------|-----------|-----------|------|
+| id 查询(唯一约束) | 6 hits | 36 hits | 6× |
+| role 查询(普通索引) | 26 hits | 56 hits | 2× |
+| shortestPath(端点索引) | 34 hits | 5112 hits | **150×** |
