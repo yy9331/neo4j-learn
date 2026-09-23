@@ -21,7 +21,8 @@ async function main() {
   await run('示例 1:SET 单个属性(孙悟空→金箍棒)', clause1);
 
   // ---------- 示例 2:SET 多个属性(等价 +=) ----------
-  // cypher-builder 不直接支持 +=,用多条 .set() 等价
+  // 注:cypher-builder 3.3.0 已支持 SET +=,写法是 .set([p, "+=", new Map({...})])
+  //   但多条 .set() 更直观,这里用等价写法演示
   // Cypher: MATCH (p:Person {name:'白龙马'}) SET p.weapon = '龙鳞枪', p.origin = '西海龙宫'
   const p2 = new NamedNode('p2');
   const clause2 = new Match(

@@ -12,7 +12,7 @@
 | 第 2 阶段:图遍历(核心) | ✅ 已完成 | 变长路径、最短路径、方向踩坑 |
 | 第 3 阶段:写入与数据建模 | ✅ 已完成 | SET/REMOVE、多标签、MERGE、方向设计、建模思维 |
 | 第 4 阶段:索引与性能 | ✅ 已完成 | 唯一约束/普通索引/EXPLAIN/PROFILE/DB hits/CartesianProduct 爆炸 |
-| 第 5 阶段:高级 Cypher | ⏳ 待开始 | 子查询、列表推导、CASE WHEN |
+| 第 5 阶段:高级 Cypher | ✅ 已完成 | CALL{} 新语法 CALL(p)、EXISTS 表达式、列表/模式推导、UNWIND/FOREACH、CASE WHEN、UNION |
 | 第 6 阶段:生产实践 | ⏳ 选学 | driver 单例、APOC、GDS、备份 |
 
 ---
@@ -878,7 +878,7 @@ Browser 里显示的 `<id>` 是 Neo4j 的**内部 ID**,是元数据不是属性,
 
 ---
 
-## 第 5 阶段:高级 Cypher ⏳
+## 第 5 阶段:高级 Cypher ✅
 
 ### 5.1 知识点清单
 
@@ -894,6 +894,225 @@ Browser 里显示的 `<id>` 是 Neo4j 的**内部 ID**,是元数据不是属性,
 | `UNION` / `UNION ALL` | 合并结果集 | 两个 MATCH 的结果拼接 |
 
 **学习目标:** 用子查询找出"被观音度化过且是妖魔的人",用列表推导把路径上所有名字拼成一个数组。
+
+---
+
+### 5.2 示例查询(8 个示例,逐一对应知识点)
+
+> 全部 cypher-builder 对照写法见 [practice4.js](practice4.js)。下面只列 Cypher 原文 + 关键点。
+
+#### 示例 1a:相关子查询 `CALL (p) {}` —— 每个主角被谁度化
+
+```cypher
+MATCH (p:Person {role: '主角'})
+CALL (p) {                                  -- Neo4j 5.12+ 新语法
+  MATCH (g:Person)-[:度化]->(p)              -- 用到了外层的 p,所以 CALL(p) 传变量
+  RETURN g.name AS 度化者
+}
+RETURN p.name AS 姓名, collect(度化者) AS 被谁度化;
+```
+
+结果:5 行,每个主角的 `被谁度化` 都是 `["观音菩萨"]`。
+
+#### 示例 1b:不相关子查询 `CALL () {}` —— 妖魔带主角总数
+
+```cypher
+MATCH (p:Person {role: '妖魔'})
+CALL () {                                   -- 不传变量,空括号
+  MATCH (a:Person {role: '主角'})
+  RETURN count(a) AS 主角总数
+}
+RETURN p.name AS 姓名, 主角总数;              -- 不用 collect,子查询返回单标量
+```
+
+结果:4 行妖魔,每行 `主角总数 = 5`。
+
+#### 示例 2:`EXISTS()` 检查关系方向 —— 谁度化过别人
+
+```cypher
+MATCH (p:Person)
+WHERE EXISTS((p)-[:度化]->())               -- 函数式,推荐写法
+RETURN p.name AS 度化者;
+```
+
+结果:1 行,观音菩萨。
+
+**关键规则:** `EXISTS()` 的 pattern 里**不能引入新变量**(如 `(g:Person {name:'观音菩萨'})` 会报错),只能用外层变量或匿名 `()`。要过滤具体起点,用直接 MATCH 关系链代替 EXISTS。
+
+#### 示例 3:列表推导 —— 奇数乘 10
+
+```cypher
+RETURN [x IN range(1, 10) WHERE x % 2 <> 0 | x * 10] AS 奇数乘十;
+```
+
+结果:`[10, 30, 50, 70, 90]`。
+
+**语法:** `[变量 IN 列表 WHERE 谓词 | 映射表达式]`,WHERE 可选。管道符 `|` 不能漏。
+
+#### 示例 3b:列表推导从节点列表提取属性
+
+```cypher
+MATCH (a:Person {name: '孙悟空'})-[:师兄弟]-(b)
+WITH collect(b) AS brothers
+RETURN [x IN brothers | x.name] AS 师兄弟名字;
+```
+
+结果:`["沙僧", "猪八戒"]`(顺序可能不同)。
+
+#### 示例 4:模式推导 —— 观音度化的人名数组
+
+```cypher
+MATCH (a:Person {name: '观音菩萨'})
+RETURN [(a)-[:度化]->(b) | b.name] AS 度化名单;
+```
+
+结果:5 个被度化者的名字。
+
+**对比列表推导:** 模式推导的 `IN` 后面是图 pattern 而不是列表,适合"针对一个起点取邻居属性数组"。映射表达式只能是标量(如 `b.name`),不能是整个节点。
+
+#### 示例 5:`UNWIND` + `MATCH` + `collect` —— 介绍数组
+
+```cypher
+UNWIND ['唐僧', '孙悟空', '猪八戒', '沙僧'] AS name
+MATCH (p:Person {name: name})
+RETURN collect(p.name + '-' + p.role) AS 介绍;
+```
+
+结果:1 行 `["唐僧-主角", "孙悟空-主角", "猪八戒-主角", "沙僧-主角"]`。
+
+**关键:** UNWIND 本身**不丢 null**(null 元素会变成一行 null);后续 MATCH 匹配不到才会丢。`collect` 是 UNWIND 的逆运算,二者常配合使用。
+
+#### 示例 6:`FOREACH` 批量 SET —— 给妖魔加 danger 属性
+
+```cypher
+-- ⚠️ 会修改数据,跑完重跑 node import.js 恢复
+MATCH (p:Person {role: '妖魔'})
+FOREACH (n IN [p] | SET n.danger = 'high')
+RETURN p.name AS 姓名, p.danger;
+```
+
+结果:4 行,每个妖魔 `danger = 'high'`。
+
+**关键:** `[p]` 是单元素列表(FOREACH 第一个参数必须是列表)。FOREACH 的 `|` 后只能写 `SET / CREATE / MERGE / DELETE`,不能写 `MATCH / RETURN / WHERE`。
+
+#### 示例 7:`CASE WHEN` + `EXISTS` —— 度化身份分类
+
+```cypher
+MATCH (p:Person)
+RETURN p.name AS 姓名,
+       CASE
+         WHEN EXISTS((p)-[:度化]->()) THEN '度化者'    -- 有度化出边
+         WHEN EXISTS(()-[:度化]->(p)) THEN '被度化'    -- 有度化入边
+         ELSE '无关'
+       END AS 身份;
+```
+
+结果:15 行,观音 1 行(度化者)、5 主角(被度化)、9 其他(无关)。
+
+**关键:** CASE 是**表达式**(必须返回值),不是语句(不能在里面写 MATCH)。EXISTS 是表达式,可以放 CASE WHEN 的条件里,不限于 WHERE 子句。
+
+#### 示例 8a:`UNION` 去重合并 —— 观音度化 ∪ 悟空师兄弟
+
+```cypher
+MATCH (g:Person {name: '观音菩萨'})-[:度化]->(p)
+RETURN p.name AS 姓名
+UNION
+MATCH (a:Person {name: '孙悟空'})-[:师兄弟]-(p)
+RETURN p.name AS 姓名;
+```
+
+结果:**5 行**(5 被度化 ∪ 2 师兄弟 - 2 重复 = 5)。
+
+#### 示例 8b:`UNION ALL` 保留重复 —— 对照行数
+
+把上面 `UNION` 改为 `UNION ALL`,其他不变:
+
+结果:**7 行**(5 + 2 = 7,猪八戒、沙僧各出现 2 次)。
+
+**关键规则:** 子查询列数和列类型必须一致;列名以第一个查询为准。`UNION` 默认去重(Neo4j 5.19+ 可加 `DISTINCT` 显式),`UNION ALL` 保留所有重复。
+
+---
+
+### 5.3 语法速查
+
+#### `CALL {}` 新旧语法对照(Neo4j 5.12+ 大改)
+
+| 写法 | 状态 | 适用 |
+|------|------|------|
+| `CALL { WITH p MATCH ... }` | ⚠️ 已废弃,会有 deprecation warning | 旧代码 |
+| `CALL { MATCH ... }`(裸) | ⚠️ 已废弃,要写 `CALL () { ... }` | 旧代码 |
+| `CALL (p) { ... }` | ✅ 新语法,推荐 | 相关子查询(传变量) |
+| `CALL () { ... }` | ✅ 新语法,推荐 | 不相关子查询(空括号) |
+| `CALL (a, b) { ... }` | ✅ 传多个变量 | 多变量相关子查询 |
+| `CALL (*) { ... }` | ✅ 传所有外层变量 | 简化相关子查询 |
+
+#### `EXISTS` 的用法位置
+
+| 位置 | 例子 |
+|------|------|
+| `WHERE` 过滤 | `WHERE EXISTS((p)-[:度化]->())` |
+| `CASE WHEN` 条件 | `CASE WHEN EXISTS(...) THEN ... END` |
+| `WITH` 过滤 | `WITH p WHERE EXISTS(...)` |
+
+EXISTS 是**布尔表达式**,不限于 WHERE。pattern 里**不能引入新变量**,只能用外层变量或匿名 `()`。
+
+#### 列表推导 vs 模式推导
+
+| | 列表推导 | 模式推导 |
+|--|---------|---------|
+| 语法 | `[x IN list WHERE ... \| expr]` | `[(pattern) WHERE ... \| expr]` |
+| `IN` 后面 | 列表(数组/`collect` 结果/`range`/`nodes`) | 图 pattern |
+| 何时用 | 已有列表,要过滤+映射 | 从某起点取邻居属性数组 |
+| 简写 | 可省 WHERE | 可省 WHERE |
+
+#### `UNWIND` / `collect` / `FOREACH` 对比
+
+| | 作用 | 输出 |
+|--|------|------|
+| `UNWIND list AS x` | 列表 → 多行 | 多行,每行一个元素 |
+| `collect(x)` | 多行 → 列表 | 一个数组 |
+| `FOREACH (x IN list \| 写操作)` | 对每个元素执行写操作 | 无输出(只改数据) |
+
+#### `UNION` vs `UNION ALL`
+
+| | `UNION` | `UNION ALL` |
+|--|---------|-------------|
+| 去重 | ✅ | ❌ |
+| 性能 | 慢(要排序去重) | 快(直接拼) |
+| 何时用 | 怕重复 | 确定无重复,或想要所有行 |
+
+---
+
+### 5.4 易错点(本次练习踩过的坑)
+
+| # | 坑 | 表现 | 解决 |
+|---|----|------|------|
+| 1 | `CALL { WITH p ... }` 旧语法废弃 | Neo4j Browser 给 deprecation warning | 改用 `CALL (p) { ... }`(5.12+ 新语法) |
+| 2 | 裸 `CALL {}` 也会废弃 | 同上 | 改用 `CALL () { ... }`(空括号) |
+| 3 | 漏写 `WITH p` 导致变量 shadowing | 子查询里的 p 不是外层 p,匹配全表 | 用新语法 `CALL (p)` —— 作用域显式声明,不会再 shadow |
+| 4 | `EXISTS()` 里写新变量 `(g:Person {...})` | 报错 `PatternExpressions are not allowed to introduce new variables` | 改用匿名 `()`,或改用直接 MATCH 关系链 |
+| 5 | 误以为 `UNWIND` 会丢 null | 跑出来 null 元素还在 | UNWIND 不丢 null;后续 MATCH 匹配不到才会丢 |
+| 6 | 不相关子查询用了 `collect` | 标量值被包成单元素数组 `[5]` 而不是 `5` | 子查询只返回一行标量时,外层直接引用,不用 collect |
+| 7 | `EXISTS` 只能放 WHERE? | 之前以为是这样 | 错!EXISTS 是布尔表达式,CASE WHEN 条件、WITH 过滤都能用 |
+| 8 | UNION 行数算错 | 把 5(去重)误算成 7 | UNION 去重:5 + 2 - 重复数(2)= 5;UNION ALL:5 + 2 = 7 |
+| 9 | `FOREACH` 第一个参数忘了包列表 | 直接写 `FOREACH (n IN p \| ...)` 报错 | 必须是列表,单节点要包成 `[p]` |
+| 10 | `FOREACH` 里写 `MATCH` | 报错 | FOREACH 只支持 `SET / CREATE / MERGE / DELETE`,要 MATCH 改用 UNWIND + SET |
+| 11 | 模式推导想返回整个节点 | `[(a)-[:度化]->(b) \| b]` 报错 | 映射表达式只能是标量(如 `b.name`),不能是节点 |
+| 12 | cypher-builder 的 `.return(expr, alias)` 误传两个参数 | 被当成两列分别 return | 别名要用二元组 `[expr, alias]` 形式 |
+
+---
+
+### 5.5 核心收获
+
+- **CALL 子查询在 Neo4j 5.12+ 大改** —— `WITH p` 从子查询内部挪到了 `CALL` 括号上,新语法 `CALL (p) { ... }` 更安全(不会 shadowing)、更简洁。老语法虽然还能跑但已废弃,Browser 会提示
+- **`EXISTS` 是表达式不是子句** —— 可以放 WHERE、CASE WHEN、WITH 过滤各种位置;pattern 里不能引入新变量,要过滤具体节点用直接 MATCH 关系链
+- **列表推导 = Python list comprehension** —— `[x IN list WHERE 谓词 \| 映射]`,WHERE 可选,管道符 `|` 必填
+- **模式推导是"针对当前节点的邻居数组速取器"** —— 不替代 MATCH;要遍历/聚合/路径变量时还得老老实实 MATCH
+- **`UNWIND` 是 `collect` 的逆运算** —— 不丢 null,后续 MATCH 匹配不到才会丢;和 import.js 的批量导入是标准搭配
+- **`FOREACH` 只能写,不能读** —— `|` 后只能 SET/CREATE/MERGE/DELETE,要 MATCH 改用 UNWIND + SET;第一个参数必须是列表(单节点包成 `[p]`)
+- **`CASE WHEN` 是表达式** —— 必须返回值,不能在里面写 MATCH 等子句;没命中又没 ELSE 返回 null(不报错)
+- **`UNION` 默认去重,`UNION ALL` 保留重复** —— 列数和类型必须一致,列名以第一个查询为准
+- **cypher-builder 3.3.0 已支持列表/模式推导** —— 之前 practice2.js 注释说"不支持"已过时;但 EXISTS 块式语法和 CASE 嵌套复杂场景仍建议直接写原生 Cypher
 
 ---
 
@@ -983,3 +1202,20 @@ cypher-builder 对照写法:见 [1.3 对应的 cypher-builder 写法](#13-对应
 | id 查询(唯一约束) | 6 hits | 36 hits | 6× |
 | role 查询(普通索引) | 26 hits | 56 hits | 2× |
 | shortestPath(端点索引) | 34 hits | 5112 hits | **150×** |
+
+### 第 5 阶段完成日期:2026-09-23
+
+练习过的查询类型:`CALL (p) {}` 相关子查询、`CALL () {}` 不相关子查询、`EXISTS()` 函数式检查、列表推导 `[x IN list WHERE ... | expr]`、模式推导 `[(pattern) | expr]`、`UNWIND` + `MATCH` + `collect`、`FOREACH` 批量 SET、`CASE WHEN` + `EXISTS` 分类、`UNION` / `UNION ALL` 行数对比。
+
+踩过的坑:见上方 [5.4 易错点](#54-易错点本次练习踩过的坑),共 12 个。
+
+核心收获:
+- **CALL 子查询在 Neo4j 5.12+ 大改** —— 旧语法 `CALL { WITH p ... }` 已废弃,新语法 `CALL (p) { ... }` 把变量传移到 CALL 括号上,更安全(不会 shadowing)、更简洁;不传变量也要写空括号 `CALL () { ... }`
+- **EXISTS 是表达式不是子句** —— 可以放 WHERE、CASE WHEN、WITH 过滤各种位置;pattern 里不能引入新变量(如 `(g:Person {name:'观音'})` 会报错),要过滤具体节点用直接 MATCH 关系链代替
+- **列表推导 = Python list comprehension** —— `[x IN list WHERE 谓词 | 映射]`,管道符 `|` 必填;WHERE 可选
+- **模式推导是"针对当前节点的邻居数组速取器"** —— 不替代 MATCH;要遍历/聚合/路径变量时还得老老实实 MATCH
+- **UNWIND 不丢 null** —— null 元素会变成一行 null;后续 MATCH 匹配不到才会丢。`collect` 是 UNWIND 的逆运算,二者常配合使用
+- **FOREACH 只能写不能读** —— `|` 后只能 SET/CREATE/MERGE/DELETE,要 MATCH 改用 UNWIND + SET;第一个参数必须是列表(单节点包成 `[p]`)
+- **CASE WHEN 是表达式** —— 必须返回值,不能在里面写 MATCH 等子句;没命中又没 ELSE 返回 null(不报错)
+- **UNION 默认去重,UNION ALL 保留重复** —— 列数和类型必须一致,列名以第一个查询为准
+- **cypher-builder 3.3.0 已支持列表/模式推导** —— 之前 practice2.js 注释说"不支持"已过时;但 EXISTS 块式语法、CASE 嵌套 EXISTS、FOREACH+SET 等复杂场景仍建议直接写原生 Cypher
