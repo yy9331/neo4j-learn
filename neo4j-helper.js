@@ -45,16 +45,79 @@ export function cleanValue(v) {
   return v;
 }
 
-/** 递归清理对象/数组里的 Integer */
+/** 递归清理对象/数组里的 Integer + Neo4j Path/Node 对象 */
 export function cleanObject(obj) {
+  // Integer(数字)
   if (obj && typeof obj === 'object' && 'low' in obj && 'high' in obj) return cleanValue(obj);
+  // Neo4j Path 对象(有 start/end/segments/length 字段)
+  if (isPath(obj)) return simplifyPath(obj);
+  // Neo4j Node 对象(有 identity/labels/properties/elementId 字段)
+  if (isNode(obj)) return simplifyNode(obj);
+  // Neo4j Relationship 对象(有 identity/startNode/endNode/type/properties/elementId)
+  if (isRelationship(obj)) return simplifyRelationship(obj);
+  // 数组
   if (Array.isArray(obj)) return obj.map(cleanObject);
+  // 普通对象
   if (obj && typeof obj === 'object') {
     return Object.fromEntries(
       Object.entries(obj).map(([k, v]) => [k, cleanObject(v)])
     );
   }
   return obj;
+}
+
+// ============ Neo4j 对象简化 ============
+
+/** 判断是否是 Neo4j Path 对象 */
+function isPath(obj) {
+  return obj && typeof obj === 'object' && !Array.isArray(obj)
+    && 'start' in obj && 'end' in obj && 'segments' in obj && 'length' in obj;
+}
+
+/** 判断是否是 Neo4j Node 对象 */
+function isNode(obj) {
+  return obj && typeof obj === 'object' && !Array.isArray(obj)
+    && 'identity' in obj && 'labels' in obj && 'elementId' in obj && !('startNode' in obj);
+}
+
+/** 判断是否是 Neo4j Relationship 对象 */
+function isRelationship(obj) {
+  return obj && typeof obj === 'object' && !Array.isArray(obj)
+    && 'identity' in obj && 'startNode' in obj && 'endNode' in obj && 'type' in obj;
+}
+
+/** 取节点的可读标识(优先 name 属性) */
+function nodeToName(node) {
+  if (!node || typeof node !== 'object') return node;
+  if (node.properties && node.properties.name != null) return node.properties.name;
+  if ('identity' in node) return `<node#${node.identity}>`;
+  return node;
+}
+
+/** 把 Path 对象简化为 {length, nodes, relationships} */
+function simplifyPath(path) {
+  // 从 segments 提取所有节点名(start + 每个 segment 的 end)
+  const nodeNames = [nodeToName(path.start)];
+  const relTypes = [];
+  for (const seg of path.segments || []) {
+    nodeNames.push(nodeToName(seg.end));
+    if (seg.relationship && seg.relationship.type) relTypes.push(seg.relationship.type);
+  }
+  return {
+    length: path.length,
+    nodes: nodeNames,
+    ...(relTypes.length ? { relationships: relTypes } : {}),
+  };
+}
+
+/** 把 Node 对象简化为 name(或 identity) */
+function simplifyNode(node) {
+  return nodeToName(node);
+}
+
+/** 把 Relationship 对象简化为 type 字符串 */
+function simplifyRelationship(rel) {
+  return `<${rel.type}>`;
 }
 
 // ============ 执行 cypher-builder clause 并打印 ============
@@ -78,7 +141,9 @@ export async function run(label, clause, session) {
   const res = await s.run(cypher, params);
   console.log(`  结果(${res.records.length} 行):`);
   for (const record of res.records) {
-    console.log('  →', cleanObject(record.toObject()));
+    // 用 JSON.stringify 输出单行紧凑形式,避免 console.log 多行展开
+    const obj = cleanObject(record.toObject());
+    console.log('  →', JSON.stringify(obj));
   }
   return res;
 }
