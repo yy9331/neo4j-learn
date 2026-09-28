@@ -13,7 +13,7 @@
 | 第 3 阶段:写入与数据建模 | ✅ 已完成 | SET/REMOVE、多标签、MERGE、方向设计、建模思维 |
 | 第 4 阶段:索引与性能 | ✅ 已完成 | 唯一约束/普通索引/EXPLAIN/PROFILE/DB hits/CartesianProduct 爆炸 |
 | 第 5 阶段:高级 Cypher | ✅ 已完成 | CALL{} 新语法 CALL(p)、EXISTS 表达式、列表/模式推导、UNWIND/FOREACH、CASE WHEN、UNION |
-| 第 6 阶段:生产实践 | ⏳ 选学 | driver 单例、APOC、GDS、备份 |
+| 第 6 阶段:生产实践 | ⏳ 选学 | driver 单例、APOC、备份(已学 1/2/3/5,跳过 GDS) |
 
 ---
 
@@ -1120,17 +1120,276 @@ EXISTS 是**布尔表达式**,不限于 WHERE。pattern 里**不能引入新变�
 
 ### 6.1 知识点清单
 
-| 知识点 | 干什么 |
-|--------|--------|
-| 事务管理 | `session.beginTransaction()`、读写事务、回滚 |
-| driver 调优 | `maxConnectionPoolSize`、`connectionAcquisitionTimeout` |
-| APOC 库 | 数百个实用过程(数据转换、图操作、批处理) |
-| GDS 库 | 图算法:PageRank、社区检测、相似度 |
-| 备份恢复 | `neo4j-admin database dump`、`load` |
-| 安全 | 角色权限、RBAC、加密 |
-| 可视化 | `neovis.js`、`d3.js` 把图渲染到网页 |
-| GraphQL | `@neo4j/graphql` 自动生成 API |
-| 集群 | Causal Cluster、读副本、分片 |
+| # | 知识点 | 干什么 | 状态 | 脚本 |
+|---|--------|--------|------|------|
+| 1 | 事务管理 | `executeWrite`/`executeRead` 事务函数、回滚 | ✅ | practise5.js |
+| 2 | driver 调优 | `maxConnectionPoolSize`、连接池、路由 | ✅ | practise6.js |
+| 3 | APOC 库 | `apoc.coll.partition`、`apoc.path.expandConfig`、`apoc.meta.schema` | ✅ | practise7.js |
+| 4 | GDS 库 | 图算法:PageRank、社区检测、相似度 | ⏭️ 跳过 | — |
+| 5 | 备份恢复 | `neo4j-admin database dump`/`load`(社区版需停服务) | ✅ | practise8.sh |
+| 6 | 安全 | 角色权限、RBAC、加密 | ⏳ | — |
+| 7 | 可视化 | `neovis.js`、`d3.js` 把图渲染到网页 | ⏳ | — |
+| 8 | GraphQL | `@neo4j/graphql` 自动生成 API | ⏳ | — |
+| 9 | 集群 | Causal Cluster、读副本、分片 | ⏳ | — |
+
+---
+
+## 6.2 事务管理 ✅
+
+### 核心概念
+
+Neo4j 的 ACID 事务模型,三种使用方式:
+
+| 方式 | API | 推荐度 |
+|------|-----|--------|
+| 自动提交 | `session.run(cypher)` | 一次性查询 OK |
+| 显式事务 | `session.beginTransaction()` + 手动 commit/rollback | ❌ 不推荐 |
+| **事务函数** | `session.executeWrite(async tx => { ... })` | ✅ **首选** |
+
+事务函数自动处理 commit/rollback,还自带重试(死锁、网络抖动)。
+
+### 关键代码(practise5.js)
+
+```js
+// 写入:原子建立两条关系,任一失败全部回滚
+await session.executeWrite(async tx => {
+  await tx.run(
+    `MATCH (g:Person {name: $gyName})
+     WITH g
+     MATCH (h:Person {name: $hhName})
+     MERGE (g)-[:度化]->(h)`,
+    { gyName: '观音菩萨', hhName: '红孩儿' }
+  );
+  await tx.run(
+    `MATCH (g:Person {name: $gyName})
+     WITH g
+     MATCH (h:Person {name: $hhName})
+     MERGE (h)-[:拜师]->(g)`,
+    { gyName: '观音菩萨', hhName: '红孩儿' }
+  );
+});
+
+// 只读事务(集群场景路由到 follower)
+await session.executeRead(async tx => {
+  const res = await tx.run('MATCH (n) RETURN count(n) AS 总数');
+  // ...
+});
+```
+
+### 易错点
+
+- **参数化 `$name` 不是 JS 模板 `${name}`**:`$name` 是 Cypher 占位符,第二参数 `{ name: value }` 绑定,防止注入;`${name}` 是字符串拼接,失去参数化好处
+- **MERGE 关系前必须先 MATCH 端点节点**:关系不能凭空 CREATE,要先找到两端节点
+- **多 MATCH 拆开比 `MATCH (a), (b)` 好**:避免 cartesian product 警告(1×1 无害但是 code smell)
+- **`executeWrite` vs `executeRead`**:写必须用 executeWrite,读用 executeRead(集群时自动路由 follower)
+
+---
+
+## 6.3 driver 调优 ✅
+
+### driver 是什么
+
+driver = 连接池 + 路由表 + 重试策略的组合体。**应用启动时创建一次,全局复用,进程退出前 close**。
+
+### driver vs session
+
+| | driver | session |
+|---|---|---|
+| 数量 | 应用一个 | 一个 driver 可开 N 个 |
+| 生命周期 | 全程 | 单次任务,用完即 close |
+| 复用 | 全局复用 | 不要跨请求复用 |
+
+### 连接池配置
+
+```js
+neo4j.driver(URI, neo4j.auth.basic(USER, PASSWORD), {
+  maxConnectionPoolSize: 100,              // 池子上限,默认 100
+  connectionAcquisitionTimeout: 60000,     // 拿不到连接最多等 ms,默认 60s
+  maxConnectionLifetimeInPool: 3600000,    // 连接最长活多久,默认 1h
+  connectionLivenessCheckTimeout: 3600000, // 闲置超过此时长用前 ping,默认 1h
+  maxTransactionRetryTime: 30,             // 事务重试总时间窗 s,默认 30s
+});
+```
+
+### 并发实验结论(practise6.js)
+
+**pool=1 vs pool=10 对照实验**(5 个相同查询并发):
+
+| pool size | 总耗时 | 行为 |
+|-----------|--------|------|
+| 1 | 37ms | 串行(LIFO 调度),总耗时 ≈ 各查询耗时之和 |
+| 10 | 49ms | 并发,总耗时 ≈ max(各查询耗时) |
+
+**反直觉结论**:本地小数据是 CPU 密集场景,串行(37ms)比并发(49ms)还快!连接池调优在 **IO 密集场景**(网络延迟大、返回大数据、锁等待)才有明显收益。
+
+### 连接池大小怎么定
+
+不是越大越好:
+
+| 因素 | 说明 |
+|------|------|
+| 峰值并发数 | 池子至少要 ≥ 峰值并发,否则请求排队 |
+| 服务端承载 | 池子越大,服务端连接越多,压力越大 |
+| 经验值 | `峰值并发 × 1.2`,监控 acquisition timeout 再微调 |
+| 调大信号 | 出现 `ConnectionAcquisitionError` 或等待时间过长 |
+
+### 易错点
+
+- **driver 要单例**:每个请求 `neo4j.driver(...)` 会反复建池子、认证,性能崩盘
+- **session 不要长期复用**:helper.js 的全局 session 是学习脚本方便,生产要每个请求 `driver.session()` → 用完 `session.close()`
+- **只有事务函数自动重试**:裸 `session.run` 不重试
+
+---
+
+## 6.4 APOC 库 ✅
+
+### APOC 是什么
+
+**A**wesome **P**rocedures **O**n **C**ypher —— 官方社区贡献的 Java 存储过程,补足 Cypher 表达能力。**装在 Neo4j 服务端(plugins 目录),不是 npm 装 Node.js 端**。
+
+### 安装(Docker)
+
+```bash
+# 重建容器,加 NEO4J_PLUGINS 环境变量
+docker run -d --name neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/your_password \
+  -e NEO4J_PLUGINS='["apoc"]' \
+  -v <data-volume>:/data \
+  neo4j:5
+```
+
+启动时自动下载 APOC Core jar 并配置 `dbms.security.procedures.unrestricted=apoc.*`。
+
+### 调用形式
+
+```cypher
+CALL apoc.xxx.yyy(...) YIELD field RETURN ...
+```
+
+### 三个常用场景(practise7.js)
+
+**1. 集合分批 `apoc.coll.partition`**
+
+```cypher
+MATCH (p:Person)
+WITH collect(p.name) AS allNames
+CALL apoc.coll.partition(allNames, 5) YIELD value AS batch
+RETURN batch
+```
+
+**2. 可配置图遍历 `apoc.path.expandConfig`**
+
+```cypher
+MATCH (t:Person {name: '唐僧'})
+CALL apoc.path.expandConfig(t, {
+  relationshipFilter: '师徒>',   -- >出 <入 双向
+  minLevel: 1,
+  maxLevel: 3,
+  uniqueness: 'NODE_GLOBAL',    -- 同一节点不重复访问
+  maxNodes: 100,                 -- 最多访问节点数(防爆炸)
+  bfs: true                      -- 广度优先
+}) YIELD path
+RETURN [n IN nodes(path) | n.name] AS 路径, length(path) AS 跳数
+```
+
+原生变长路径做不到的:避免节点重复、限制总节点数、标签过滤、BFS/DFS 切换。
+
+**3. Schema 查询 `apoc.meta.schema`**
+
+```cypher
+CALL apoc.meta.schema() YIELD value RETURN value
+```
+
+一行拿到完整 Schema(标签、关系类型、属性+类型),原生要分别调 `db.labels()` / `db.relationshipTypes()` / `db.propertyKeys`。
+
+### APOC 真正不可替代的能力
+
+| 能力 | 原生 | APOC |
+|------|------|------|
+| 从 URL 加载 JSON | ❌ | `apoc.load.json('https://...')` |
+| 动态构造 Cypher | ❌ | `apoc.cypher.run('MATCH (n:' + label + ')...')` |
+| 批量分批写入 | ❌ | `apoc.periodic.iterate(...)` |
+| HTTP 请求外部 API | ❌ | `apoc.load.jsonRequest` |
+
+### `apoc.periodic.iterate`(生产必学)
+
+```cypher
+CALL apoc.periodic.iterate(
+  'MATCH (p:Person) RETURN p',                          -- 游标查询
+  'SET p.upperName = toUpper(p.name)',                  -- 每行执行的写操作
+  { batchSize: 10000, parallel: false, retries: 3 }     -- 配置
+) YIELD batches, total, errorTransactions
+RETURN batches, total, errorTransactions
+```
+
+`parallel` 写操作**别开并发**(会锁冲突),读操作才开。
+
+---
+
+## 6.5 备份恢复 ✅
+
+### 三种备份方式
+
+| 方式 | 命令 | 停服 | 适用 |
+|------|------|------|------|
+| 冷复制 | 直接 cp `/data` 目录 | ✅ 必须 | 紧急备份(风险大) |
+| **dump**(逻辑) | `neo4j-admin database dump` | 社区版需停服务 | **小数据/迁移首选** |
+| **backup**(物理) | `neo4j-admin backup backup` | 在线+增量 | 生产首选(Enterprise) |
+
+### 社区版 dump/load 限制
+
+- `STOP DATABASE` 对默认库 `neo4j` **不生效**
+- dump/load 必须**停掉整个 Neo4j 服务**
+- 做法:停容器 → 临时容器 `--volumes-from` 复用 data 卷执行 dump/load → 启动原容器
+
+### 核心命令(practise8.sh)
+
+```bash
+# 备份(社区版流程)
+docker stop neo4j
+docker run --rm --volumes-from neo4j neo4j:5 \
+  neo4j-admin database dump neo4j \
+  --to-path=/data/backup --overwrite-destination=true
+docker start neo4j
+docker cp neo4j:/data/backup/neo4j.dump ./backup/neo4j-<时间戳>.dump
+
+# 恢复
+docker cp ./backup/neo4j-<时间戳>.dump neo4j:/data/backup/neo4j.dump
+docker stop neo4j
+docker run --rm --volumes-from neo4j neo4j:5 \
+  neo4j-admin database load neo4j \
+  --from-path=/data/backup --overwrite-destination=true
+docker start neo4j
+```
+
+### 关键参数
+
+| 参数 | 说明 |
+|------|------|
+| `--to-path` / `--from-path` | dump 输出/输入的**目录**(不是文件路径) |
+| `--overwrite-destination=true` | backup 覆盖旧 dump,restore 覆盖现有数据(必加) |
+| dump 文件名 | 自动叫 `<数据库名>.dump`,load 时在目录里找这个名 |
+
+### 实战验证闭环(已跑通)
+
+```
+备份(15节点) → DETACH DELETE 孙悟空(14节点) → restore → 验证孙悟空回来(15节点) ✅
+```
+
+### 易错点
+
+- **`DELETE n` 不能删有连边的节点**:必须用 `DETACH DELETE n`(先删关系再删节点)
+- **dump 文件名要和数据库名一致**:load 时 `--from-path` 指目录,它自动找 `neo4j.dump`
+- **`--from-path` 是目录不是文件**:别写成 `/data/backup/neo4j.dump`
+- **restore 是破坏性操作**:现有数据会被 dump 内容完全替换
+
+### 生产备份策略
+
+- 全量 dump:每天 1 次,上传到 S3/OSS
+- 增量 backup(Enterprise):每小时
+- 恢复演练:每月从备份恢复到测试实例验证
+- 保留:7 日备 + 4 周备 + 12 月备
 
 ---
 
@@ -1219,3 +1478,16 @@ cypher-builder 对照写法:见 [1.3 对应的 cypher-builder 写法](#13-对应
 - **CASE WHEN 是表达式** —— 必须返回值,不能在里面写 MATCH 等子句;没命中又没 ELSE 返回 null(不报错)
 - **UNION 默认去重,UNION ALL 保留重复** —— 列数和类型必须一致,列名以第一个查询为准
 - **cypher-builder 3.3.0 已支持列表/模式推导** —— 之前 practice2.js 注释说"不支持"已过时;但 EXISTS 块式语法、CASE 嵌套 EXISTS、FOREACH+SET 等复杂场景仍建议直接写原生 Cypher
+
+### 第 6 阶段完成日期:2026-09-28(知识点 1/2/3/5,GDS 跳过)
+
+练习过的脚本:practise5.js(事务)、practise6.js(driver 调优)、practise7.js(APOC)、practise8.sh(备份恢复)。
+
+核心收获:
+- **事务函数 `executeWrite/executeRead` 是首选**:自动 commit/rollback + 重试;参数化用 `$name` 不是 `${name}`
+- **driver 要单例,session 不要跨请求复用**:连接池配置核心是 `maxConnectionPoolSize`,不是越大越好
+- **连接池调优反直觉**:本地 CPU 密集场景串行比并发快,只有 IO 密集场景(网络延迟、大数据、锁等待)才看得出效果
+- **APOC 装在服务端不是 npm**:Docker 用 `NEO4J_PLUGINS=['apoc']` 一键装;真正不可替代的是 `apoc.load.json`(URL 加载)、`apoc.periodic.iterate`(批量写入)、`apoc.cypher.run`(动态 Cypher)
+- **社区版 dump/load 必须停服务**:`STOP DATABASE` 对默认库不生效,要停整个容器 + `--volumes-from` 临时容器执行
+- **`DETACH DELETE n` 才能删有连边的节点**:普通 `DELETE n` 会报错"节点还有关系"
+- **`--from-path` 是目录不是文件路径**:load 时自动找 `<数据库名>.dump`
